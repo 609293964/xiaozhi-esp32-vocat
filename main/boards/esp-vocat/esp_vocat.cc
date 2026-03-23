@@ -32,6 +32,9 @@
 #include <ctime>
 #include <cstdlib>
 #include <atomic>
+#if CONFIG_USE_EMOTE_MESSAGE_STYLE
+#include "gfx.h"
+#endif
 
 #define TAG "ESP-VoCat"
 LV_FONT_DECLARE(BUILTIN_TEXT_FONT);
@@ -467,6 +470,21 @@ private:
     lv_obj_t* clock_colon_bottom_ = nullptr;
     esp_timer_handle_t clock_timer_ = nullptr;
     bool clock_wallpaper_mode_ = false;
+    // When voice conversation interrupts the full-screen clock overlay,
+    // restore it automatically after the conversation ends.
+    esp_timer_handle_t clock_restore_timer_ = nullptr;
+    bool clock_restore_pending_ = false;
+    // When hiding clock due to voice state changes, don't force emote idle state.
+    bool suppress_emote_idle_on_hide_ = false;
+#if CONFIG_USE_EMOTE_MESSAGE_STYLE
+    bool emote_clock_mode_ = false;
+    struct EmoteClockDigit {
+        gfx_obj_t* seg[7] = {nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr};
+    };
+    EmoteClockDigit emote_clock_digits_[4];
+    gfx_obj_t* emote_clock_colon_top_ = nullptr;
+    gfx_obj_t* emote_clock_colon_bottom_ = nullptr;
+#endif
     bool external_power_connected_ = true;
     bool power_loss_countdown_active_ = false;
     int64_t power_loss_deadline_us_ = 0;
@@ -531,6 +549,63 @@ private:
         digit.seg[6] = CreateClockSegment(parent, x + t, y + middle_y, w - 2 * t, t);
     }
 
+    #if CONFIG_USE_EMOTE_MESSAGE_STYLE
+    void SetEmoteSegmentOn(gfx_obj_t* segment, bool on)
+    {
+        if (segment == nullptr) {
+            return;
+        }
+        gfx_obj_set_visible(segment, on);
+    }
+
+    void SetEmoteDigitValue(EmoteClockDigit& digit, int value)
+    {
+        static const uint8_t map[10] = {
+            0x3F, 0x06, 0x5B, 0x4F, 0x66,
+            0x6D, 0x7D, 0x07, 0x7F, 0x6F
+        };
+        uint8_t mask = 0;
+        if (value >= 0 && value <= 9) {
+            mask = map[value];
+        }
+        for (int i = 0; i < 7; ++i) {
+            SetEmoteSegmentOn(digit.seg[i], ((mask >> i) & 0x01) != 0);
+        }
+    }
+
+    gfx_obj_t* CreateEmoteClockSegment(emote_handle_t handle, const std::string& name, int x, int y, int w, int h)
+    {
+        auto* seg = emote_create_obj_by_type(handle, EMOTE_OBJ_TYPE_LABEL, name.c_str());
+        if (seg == nullptr) {
+            return nullptr;
+        }
+        gfx_label_set_text(seg, "");
+        gfx_obj_set_pos(seg, x, y);
+        gfx_obj_set_size(seg, w, h);
+        gfx_label_set_bg_enable(seg, true);
+        gfx_label_set_bg_color(seg, GFX_COLOR_HEX(0xFFFFFF));
+        gfx_label_set_color(seg, GFX_COLOR_HEX(0xFFFFFF));
+        gfx_obj_set_visible(seg, false);
+        return seg;
+    }
+
+    void CreateEmoteClockDigit(emote_handle_t handle, EmoteClockDigit& digit, int index, int x, int y, int w, int h, int t)
+    {
+        const int middle_y = (h - t) / 2;
+        const int right_x = w - t;
+        const int bottom_y = h - t;
+        const int half_h = h / 2;
+
+        digit.seg[0] = CreateEmoteClockSegment(handle, "vocat_clk_" + std::to_string(index) + "_0", x + t, y, w - 2 * t, t);
+        digit.seg[1] = CreateEmoteClockSegment(handle, "vocat_clk_" + std::to_string(index) + "_1", x + right_x, y + t, t, half_h - t);
+        digit.seg[2] = CreateEmoteClockSegment(handle, "vocat_clk_" + std::to_string(index) + "_2", x + right_x, y + half_h, t, half_h - t);
+        digit.seg[3] = CreateEmoteClockSegment(handle, "vocat_clk_" + std::to_string(index) + "_3", x + t, y + bottom_y, w - 2 * t, t);
+        digit.seg[4] = CreateEmoteClockSegment(handle, "vocat_clk_" + std::to_string(index) + "_4", x, y + half_h, t, half_h - t);
+        digit.seg[5] = CreateEmoteClockSegment(handle, "vocat_clk_" + std::to_string(index) + "_5", x, y + t, t, half_h - t);
+        digit.seg[6] = CreateEmoteClockSegment(handle, "vocat_clk_" + std::to_string(index) + "_6", x + t, y + middle_y, w - 2 * t, t);
+    }
+    #endif
+
     static void clock_timer_callback(void* arg)
     {
         auto* board = static_cast<EspVocat*>(arg);
@@ -541,6 +616,25 @@ private:
 
     void UpdateClockText()
     {
+    #if CONFIG_USE_EMOTE_MESSAGE_STYLE
+        if (emote_clock_mode_) {
+            auto* emote_display = dynamic_cast<emote::EmoteDisplay*>(display_);
+            if (emote_display == nullptr || emote_display->GetEmoteHandle() == nullptr || emote_clock_digits_[0].seg[0] == nullptr) {
+                return;
+            }
+            std::time_t now = std::time(nullptr);
+            std::tm local_tm = {};
+            localtime_r(&now, &local_tm);
+            emote_lock(emote_display->GetEmoteHandle());
+            SetEmoteDigitValue(emote_clock_digits_[0], local_tm.tm_hour / 10);
+            SetEmoteDigitValue(emote_clock_digits_[1], local_tm.tm_hour % 10);
+            SetEmoteDigitValue(emote_clock_digits_[2], local_tm.tm_min / 10);
+            SetEmoteDigitValue(emote_clock_digits_[3], local_tm.tm_min % 10);
+            emote_unlock(emote_display->GetEmoteHandle());
+            emote_notify_all_refresh(emote_display->GetEmoteHandle());
+            return;
+        }
+    #endif
         if (clock_digits_[0].seg[0] == nullptr) {
             return;
         }
@@ -561,17 +655,69 @@ private:
     void ShowClockScreen()
     {
 #if CONFIG_USE_EMOTE_MESSAGE_STYLE
-        char time_text[6] = {0};
-        std::time_t now = std::time(nullptr);
-        std::tm local_tm = {};
-        localtime_r(&now, &local_tm);
-        std::strftime(time_text, sizeof(time_text), "%H:%M", &local_tm);
-        if (display_ != nullptr) {
-            display_->ShowNotification(time_text, 1500);
+        auto* emote_display = dynamic_cast<emote::EmoteDisplay*>(display_);
+        if (emote_display == nullptr || emote_display->GetEmoteHandle() == nullptr) {
+            return;
         }
-        return;
-#endif
+        // Enter full-screen clock page: prevent Application state updates from re-showing small clock_label.
+        emote_display->SetClockPageMode(true);
+        auto handle = emote_display->GetEmoteHandle();
+        emote_set_event_msg(handle, EMOTE_MGR_EVT_IDLE, NULL);
+        emote_lock(handle);
+        if (emote_clock_digits_[0].seg[0] == nullptr) {
+            const int digit_w = (DISPLAY_WIDTH >= 320) ? 64 : 48;
+            const int digit_h = (DISPLAY_HEIGHT >= 320) ? 140 : 100;
+            const int thickness = (DISPLAY_WIDTH >= 320) ? 12 : 9;
+            const int gap = (DISPLAY_WIDTH >= 320) ? 10 : 8;
+            const int colon_w = thickness;
+            const int total_w = digit_w * 4 + gap * 4 + colon_w;
+            const int start_x = (DISPLAY_WIDTH - total_w) / 2;
+            const int start_y = (DISPLAY_HEIGHT - digit_h) / 2;
 
+            CreateEmoteClockDigit(handle, emote_clock_digits_[0], 0, start_x, start_y, digit_w, digit_h, thickness);
+            CreateEmoteClockDigit(handle, emote_clock_digits_[1], 1, start_x + digit_w + gap, start_y, digit_w, digit_h, thickness);
+            CreateEmoteClockDigit(handle, emote_clock_digits_[2], 2, start_x + digit_w * 2 + gap * 3 + colon_w, start_y, digit_w, digit_h, thickness);
+            CreateEmoteClockDigit(handle, emote_clock_digits_[3], 3, start_x + digit_w * 3 + gap * 4 + colon_w, start_y, digit_w, digit_h, thickness);
+
+            const int dot = thickness;
+            const int colon_x = start_x + digit_w * 2 + gap * 2;
+            const int top_dot_y = start_y + digit_h / 2 - dot - 8;
+            const int bottom_dot_y = start_y + digit_h / 2 + 8;
+            emote_clock_colon_top_ = CreateEmoteClockSegment(handle, "vocat_clk_colon_top", colon_x, top_dot_y, dot, dot);
+            emote_clock_colon_bottom_ = CreateEmoteClockSegment(handle, "vocat_clk_colon_bottom", colon_x, bottom_dot_y, dot, dot);
+        }
+        gfx_obj_t* default_clock = emote_get_obj_by_name(handle, EMT_DEF_ELEM_CLOCK_LABEL);
+        gfx_obj_t* eye_anim = emote_get_obj_by_name(handle, EMT_DEF_ELEM_EYE_ANIM);
+        gfx_obj_t* status_icon = emote_get_obj_by_name(handle, EMT_DEF_ELEM_STATUS_ICON);
+        gfx_obj_t* charge_icon = emote_get_obj_by_name(handle, EMT_DEF_ELEM_CHARGE_ICON);
+        gfx_obj_t* bat_label = emote_get_obj_by_name(handle, EMT_DEF_ELEM_BAT_LEFT_LABEL);
+        gfx_obj_t* clock_timer = emote_get_obj_by_name(handle, EMT_DEF_ELEM_TIMER_STATUS);
+        if (default_clock) gfx_obj_set_visible(default_clock, false);
+        // Pause the emote internal timer that keeps updating the small clock label.
+        // Otherwise even if we hide it, it may reappear on next status refresh.
+        if (clock_timer) {
+            gfx_timer_pause((gfx_timer_handle_t)clock_timer);
+            gfx_obj_set_visible(clock_timer, false);
+        }
+        if (eye_anim) gfx_obj_set_visible(eye_anim, false);
+        if (status_icon) gfx_obj_set_visible(status_icon, false);
+        if (charge_icon) gfx_obj_set_visible(charge_icon, false);
+        if (bat_label) gfx_obj_set_visible(bat_label, false);
+        for (int d = 0; d < 4; ++d) {
+            for (int s = 0; s < 7; ++s) {
+                if (emote_clock_digits_[d].seg[s]) {
+                    gfx_obj_set_visible(emote_clock_digits_[d].seg[s], true);
+                }
+            }
+        }
+        if (emote_clock_colon_top_) gfx_obj_set_visible(emote_clock_colon_top_, true);
+        if (emote_clock_colon_bottom_) gfx_obj_set_visible(emote_clock_colon_bottom_, true);
+        emote_unlock(handle);
+        emote_notify_all_refresh(handle);
+        emote_clock_mode_ = true;
+        UpdateClockText();
+        return;
+    #else
         if (!lvgl_port_lock(30000)) {
             return;
         }
@@ -636,11 +782,57 @@ private:
             ESP_ERROR_CHECK(esp_timer_create(&timer_args, &clock_timer_));
             ESP_ERROR_CHECK(esp_timer_start_periodic(clock_timer_, 1000000));
         }
+#endif
     }
 
     void HideClockScreen()
     {
 #if CONFIG_USE_EMOTE_MESSAGE_STYLE
+        auto* emote_display = dynamic_cast<emote::EmoteDisplay*>(display_);
+        if (emote_display == nullptr || emote_display->GetEmoteHandle() == nullptr) {
+            return;
+        }
+        // Exit full-screen clock page mode.
+        emote_display->SetClockPageMode(false);
+        auto handle = emote_display->GetEmoteHandle();
+        /* If this hide is triggered by voice conversation, don't force emote into IDLE.
+         * Otherwise it may temporarily override listen/speak status updates and cause overlap. */
+        if (!suppress_emote_idle_on_hide_) {
+            emote_set_event_msg(handle, EMOTE_MGR_EVT_IDLE, NULL);
+        }
+        emote_lock(handle);
+        for (int d = 0; d < 4; ++d) {
+            for (int s = 0; s < 7; ++s) {
+                if (emote_clock_digits_[d].seg[s]) {
+                    gfx_obj_set_visible(emote_clock_digits_[d].seg[s], false);
+                }
+            }
+        }
+        if (emote_clock_colon_top_) gfx_obj_set_visible(emote_clock_colon_top_, false);
+        if (emote_clock_colon_bottom_) gfx_obj_set_visible(emote_clock_colon_bottom_, false);
+        gfx_obj_t* default_clock = emote_get_obj_by_name(handle, EMT_DEF_ELEM_CLOCK_LABEL);
+        gfx_obj_t* eye_anim = emote_get_obj_by_name(handle, EMT_DEF_ELEM_EYE_ANIM);
+        gfx_obj_t* status_icon = emote_get_obj_by_name(handle, EMT_DEF_ELEM_STATUS_ICON);
+        gfx_obj_t* charge_icon = emote_get_obj_by_name(handle, EMT_DEF_ELEM_CHARGE_ICON);
+        gfx_obj_t* bat_label = emote_get_obj_by_name(handle, EMT_DEF_ELEM_BAT_LEFT_LABEL);
+        gfx_obj_t* clock_timer = emote_get_obj_by_name(handle, EMT_DEF_ELEM_TIMER_STATUS);
+        if (default_clock) gfx_obj_set_visible(default_clock, true);
+        // Resume emote internal timer for the small clock label.
+        if (clock_timer) {
+            gfx_timer_resume((gfx_timer_handle_t)clock_timer);
+            gfx_obj_set_visible(clock_timer, true);
+        }
+        if (eye_anim) gfx_obj_set_visible(eye_anim, true);
+        if (status_icon) gfx_obj_set_visible(status_icon, true);
+        if (charge_icon) gfx_obj_set_visible(charge_icon, true);
+        if (bat_label) gfx_obj_set_visible(bat_label, true);
+        emote_unlock(handle);
+        // During voice state transitions, EmoteDisplay will refresh on LISTEN/SPEAK anyway.
+        // Skipping notify here avoids heavy redraw blocking audio-related state handling.
+        if (!suppress_emote_idle_on_hide_) {
+            emote_notify_all_refresh(handle);
+        }
+        emote_clock_mode_ = false;
         return;
 #endif
 
@@ -654,7 +846,61 @@ private:
             lv_obj_add_flag(clock_screen_, LV_OBJ_FLAG_HIDDEN);
         }
         clock_wallpaper_mode_ = false;
+        /* Ensure the uncovered UI is redrawn immediately.
+         * Without this, LVGL may keep stale pixels until a later full/UI event (e.g. voice wake). */
+        lv_refr_now(lv_display_get_default());
         lvgl_port_unlock();
+    }
+
+    static void clock_restore_timer_callback(void* arg) {
+        auto* board = static_cast<EspVocat*>(arg);
+        if (board != nullptr) {
+            board->OnClockRestoreTimeout();
+        }
+    }
+
+    void StopClockRestoreTimer() {
+        if (clock_restore_timer_ != nullptr) {
+            esp_timer_stop(clock_restore_timer_);
+        }
+    }
+
+    void CancelClockRestore() {
+        clock_restore_pending_ = false;
+        StopClockRestoreTimer();
+    }
+
+    void StartClockRestoreTimer() {
+        clock_restore_pending_ = true;
+        StopClockRestoreTimer();
+
+        if (clock_restore_timer_ == nullptr) {
+            const esp_timer_create_args_t timer_args = {
+                .callback = clock_restore_timer_callback,
+                .arg = this,
+                .dispatch_method = ESP_TIMER_TASK,
+                .name = "vocat_clock_restore",
+                .skip_unhandled_events = true,
+            };
+            ESP_ERROR_CHECK(esp_timer_create(&timer_args, &clock_restore_timer_));
+        }
+
+        // Restore clock 1 minute after conversation ends.
+        ESP_LOGI(TAG, "Schedule clock restore in 60s");
+        ESP_ERROR_CHECK(esp_timer_start_once(clock_restore_timer_, 60LL * 1000000LL));
+    }
+
+    void OnClockRestoreTimeout() {
+        if (!clock_restore_pending_) {
+            return;
+        }
+        auto& app = Application::GetInstance();
+        if (app.GetDeviceState() != kDeviceStateIdle) {
+            return;
+        }
+        clock_restore_pending_ = false;
+        ESP_LOGI(TAG, "Clock restore timeout, show clock page");
+        ShowClockScreen();
     }
 
     void ChangeBacklightBrightness(int delta)
@@ -901,15 +1147,21 @@ private:
                 auto touch_event = touchpad->CheckTouchEvent();
 
                 if (touch_event == Cst816s::TOUCH_RELEASE) {
-                    if (board.clock_wallpaper_mode_) {
+                    if (board.clock_wallpaper_mode_
+#if CONFIG_USE_EMOTE_MESSAGE_STYLE
+                        || board.emote_clock_mode_
+#endif
+                    ) {
                         continue;
                     }
                     board.HandleTouchRelease();
                 } else if (touch_event == Cst816s::TOUCH_LONG_PRESS) {
                     board.EnterWifiConfigMode();
                 } else if (touch_event == Cst816s::TOUCH_SWIPE_LEFT) {
+                    board.CancelClockRestore();
                     board.ShowClockScreen();
                 } else if (touch_event == Cst816s::TOUCH_SWIPE_RIGHT) {
+                    board.CancelClockRestore();
                     board.HideClockScreen();
                 }
             }
@@ -1049,6 +1301,42 @@ private:
 #endif // CONFIG_ESP_VIDEO_ENABLE_USB_UVC_VIDEO_DEVICE
 
 public:
+    void OnDeviceStateChanged(DeviceState /*old_state*/, DeviceState new_state) override
+    {
+        bool clock_active = false;
+#if CONFIG_USE_EMOTE_MESSAGE_STYLE
+        clock_active = emote_clock_mode_;
+#else
+        clock_active = clock_wallpaper_mode_;
+#endif
+
+        const bool entering_conversation =
+            (new_state == kDeviceStateConnecting ||
+             new_state == kDeviceStateListening ||
+             new_state == kDeviceStateSpeaking ||
+             new_state == kDeviceStateActivating);
+
+        if (entering_conversation) {
+            // Conversation starts -> stop any scheduled restore.
+            StopClockRestoreTimer();
+
+            if (clock_active) {
+                // Remember we need to restore clock when conversation ends.
+                clock_restore_pending_ = true;
+
+                // Hide clock overlay immediately.
+                ESP_LOGI(TAG, "Voice state -> hide clock overlay (restore after dialog)");
+                suppress_emote_idle_on_hide_ = true;
+                HideClockScreen();
+                suppress_emote_idle_on_hide_ = false;
+            }
+        } else if (new_state == kDeviceStateIdle) {
+            if (clock_restore_pending_) {
+                StartClockRestoreTimer();
+            }
+        }
+    }
+
     ~EspVocat() {
         // Stop tasks
         if (charge_task_handle_ != nullptr) {
@@ -1064,6 +1352,11 @@ public:
             esp_timer_stop(clock_timer_);
             esp_timer_delete(clock_timer_);
             clock_timer_ = nullptr;
+        }
+        if (clock_restore_timer_ != nullptr) {
+            esp_timer_stop(clock_restore_timer_);
+            esp_timer_delete(clock_restore_timer_);
+            clock_restore_timer_ = nullptr;
         }
 
         // Delete objects

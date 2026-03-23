@@ -137,6 +137,9 @@ EmoteDisplay::~EmoteDisplay()
 void EmoteDisplay::SetEmotion(const char* const emotion)
 {
     ESP_LOGI(TAG, "SetEmotion: %s", emotion);
+    if (clock_page_mode_) {
+        return;
+    }
     if (emote_handle_ && emotion && strlen(emotion) > 0) {
         emote_set_anim_emoji(emote_handle_, emotion);
     }
@@ -145,6 +148,9 @@ void EmoteDisplay::SetEmotion(const char* const emotion)
 void EmoteDisplay::SetChatMessage(const char* const role, const char* const content)
 {
     ESP_LOGI(TAG, "SetChatMessage: %s, %s", role, content);
+    if (clock_page_mode_) {
+        return;
+    }
     if (emote_handle_ && content && strlen(content) > 0) {
         if ((std::strcmp(role, "system") == 0) && std::strstr(content, "xiaozhi.me")) {
             size_t len = strlen(content);
@@ -162,6 +168,9 @@ void EmoteDisplay::SetChatMessage(const char* const role, const char* const cont
 void EmoteDisplay::SetStatus(const char* const status)
 {
     ESP_LOGI(TAG, "SetStatus: %s", status);
+    if (clock_page_mode_) {
+        return;
+    }
     if (emote_handle_ && status && strlen(status) > 0) {
         if (std::strcmp(status, Lang::Strings::LISTENING) == 0) {
             emote_set_event_msg(emote_handle_, EMOTE_MGR_EVT_LISTEN, NULL);
@@ -173,6 +182,12 @@ void EmoteDisplay::SetStatus(const char* const status)
             emote_set_event_msg(emote_handle_, EMOTE_MGR_EVT_SET, NULL);
         }
     }
+}
+
+void EmoteDisplay::SetClockPageMode(bool enabled)
+{
+    clock_page_mode_ = enabled;
+    // No auto refresh here. Callers control visibility + call RefreshAll/notify as needed.
 }
 
 void EmoteDisplay::ShowNotification(const char* notification, int duration_ms)

@@ -14,6 +14,9 @@ public:
     EmoteDisplay(esp_lcd_panel_handle_t panel, esp_lcd_panel_io_handle_t panel_io, int width, int height);
     virtual ~EmoteDisplay();
 
+    // Keep the full-screen clock page stable by ignoring Application-driven status/emotion/chat updates.
+    void SetClockPageMode(bool enabled);
+
     virtual void SetEmotion(const char* emotion) override;
     virtual void SetStatus(const char* status) override;
     virtual void SetChatMessage(const char* role, const char* content) override;
@@ -36,6 +39,7 @@ private:
     virtual void Unlock() override;
 
     emote_handle_t emote_handle_ = nullptr;
+    bool clock_page_mode_ = false;
 
 };
 

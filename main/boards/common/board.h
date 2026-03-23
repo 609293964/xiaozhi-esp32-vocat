@@ -13,6 +13,7 @@
 #include "backlight.h"
 #include "camera.h"
 #include "assets.h"
+#include "device_state.h"
 
 /**
  * Network events for unified callback
@@ -82,6 +83,15 @@ public:
     virtual void SetPowerSaveLevel(PowerSaveLevel level) = 0;
     virtual std::string GetBoardJson() = 0;
     virtual std::string GetDeviceStatusJson() = 0;
+
+    /**
+     * Called whenever Application state machine transitions device state.
+     * Boards may override this to update board-specific overlays (e.g. clock UI).
+     */
+    virtual void OnDeviceStateChanged(DeviceState old_state, DeviceState new_state) {
+        (void)old_state;
+        (void)new_state;
+    }
 };
 
 #define DECLARE_BOARD(BOARD_CLASS_NAME) \

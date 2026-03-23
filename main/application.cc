@@ -854,12 +854,18 @@ void Application::ContinueWakeWordInvoke(const std::string& wake_word) {
 
 void Application::HandleStateChangedEvent() {
     DeviceState new_state = state_machine_.GetState();
+    DeviceState old_state = last_device_state_;
     clock_ticks_ = 0;
 
     auto& board = Board::GetInstance();
     auto display = board.GetDisplay();
     auto led = board.GetLed();
     led->OnStateChanged();
+
+    // Let the board update any overlays tied to device state.
+    // This should run before display->SetStatus/SetEmotion so that overlays can
+    // (for example) disable EmoteDisplay clock-page suppression in time.
+    board.OnDeviceStateChanged(old_state, new_state);
     
     switch (new_state) {
         case kDeviceStateUnknown:
@@ -924,6 +930,8 @@ void Application::HandleStateChangedEvent() {
             // Do nothing
             break;
     }
+
+    last_device_state_ = new_state;
 }
 
 void Application::Schedule(std::function<void()>&& callback) {
