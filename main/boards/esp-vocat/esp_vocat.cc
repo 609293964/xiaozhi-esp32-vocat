@@ -23,8 +23,16 @@
 #include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h>
 #include <freertos/task.h>
+#include <esp_timer.h>
+#include <esp_lvgl_port.h>
+#include <lvgl.h>
+#include <string>
+#include <ctime>
+#include <cstdlib>
 
 #define TAG "ESP-VoCat"
+LV_FONT_DECLARE(BUILTIN_TEXT_FONT);
+LV_FONT_DECLARE(font_puhui_30_4);
 
 
 temperature_sensor_handle_t temp_sensor = NULL;
@@ -270,6 +278,9 @@ public:
         TOUCH_NONE,
         TOUCH_PRESS,
         TOUCH_RELEASE,
+        TOUCH_LONG_PRESS,
+        TOUCH_SWIPE_LEFT,
+        TOUCH_SWIPE_RIGHT,
         TOUCH_HOLD
     };
 
@@ -278,6 +289,12 @@ public:
         read_buffer_ = new uint8_t[6];
         was_touched_ = false;
         press_count_ = 0;
+        touch_start_time_us_ = 0;
+        long_press_triggered_ = false;
+        touch_start_x_ = -1;
+        touch_start_y_ = -1;
+        touch_last_x_ = -1;
+        touch_last_y_ = -1;
 
         // Create touch interrupt semaphore
         touch_isr_mux_ = xSemaphoreCreateBinary();
@@ -314,23 +331,46 @@ public:
     {
         bool is_touched = (tp_.num > 0);
         TouchEvent event = TOUCH_NONE;
+        int64_t now = esp_timer_get_time();
 
         if (is_touched && !was_touched_) {
-            // Press event (transition from not touched to touched)
             press_count_++;
+            touch_start_time_us_ = now;
+            long_press_triggered_ = false;
+            touch_start_x_ = tp_.x;
+            touch_start_y_ = tp_.y;
+            touch_last_x_ = tp_.x;
+            touch_last_y_ = tp_.y;
             event = TOUCH_PRESS;
             ESP_LOGI(TAG, "TOUCH PRESS - count: %d, x: %d, y: %d", press_count_, tp_.x, tp_.y);
         } else if (!is_touched && was_touched_) {
-            // Release event (transition from touched to not touched)
-            event = TOUCH_RELEASE;
+            if (long_press_triggered_) {
+                event = TOUCH_NONE;
+            } else {
+                int dx = touch_last_x_ - touch_start_x_;
+                int dy = touch_last_y_ - touch_start_y_;
+                if (dx <= -60 && std::abs(dx) > std::abs(dy)) {
+                    event = TOUCH_SWIPE_LEFT;
+                } else if (dx >= 60 && std::abs(dx) > std::abs(dy)) {
+                    event = TOUCH_SWIPE_RIGHT;
+                } else {
+                    event = TOUCH_RELEASE;
+                }
+            }
             ESP_LOGI(TAG, "TOUCH RELEASE - total presses: %d", press_count_);
         } else if (is_touched && was_touched_) {
-            // Continuous touch (hold)
-            event = TOUCH_HOLD;
-            ESP_LOGD(TAG, "TOUCH HOLD - x: %d, y: %d", tp_.x, tp_.y);
+            touch_last_x_ = tp_.x;
+            touch_last_y_ = tp_.y;
+            if (!long_press_triggered_ && (now - touch_start_time_us_) >= 1500000) {
+                long_press_triggered_ = true;
+                event = TOUCH_LONG_PRESS;
+                ESP_LOGI(TAG, "TOUCH LONG PRESS - x: %d, y: %d", tp_.x, tp_.y);
+            } else {
+                event = TOUCH_HOLD;
+                ESP_LOGD(TAG, "TOUCH HOLD - x: %d, y: %d", tp_.x, tp_.y);
+            }
         }
 
-        // Update previous state
         was_touched_ = is_touched;
         return event;
     }
@@ -375,6 +415,12 @@ private:
     // Touch state tracking
     bool was_touched_;
     int press_count_;
+    int64_t touch_start_time_us_;
+    bool long_press_triggered_;
+    int touch_start_x_;
+    int touch_start_y_;
+    int touch_last_x_;
+    int touch_last_y_;
 
     // Touch interrupt semaphore
     SemaphoreHandle_t touch_isr_mux_;
@@ -382,17 +428,229 @@ private:
 
 class EspVocat : public WifiBoard {
 private:
+    struct ClockDigit {
+        lv_obj_t* seg[7] = {nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr};
+    };
+
     i2c_master_bus_handle_t i2c_bus_;
     Cst816s* cst816s_;
     Charge* charge_;
     Button boot_button_;
     Display* display_ = nullptr;
     PwmBacklight* backlight_ = nullptr;
-    esp_timer_handle_t touchpad_timer_;
-    esp_lcd_touch_handle_t tp;   // LCD touch handle
     EspVideo* camera_ = nullptr;
     TaskHandle_t charge_task_handle_ = nullptr;
     TaskHandle_t touch_task_handle_ = nullptr;
+    int touch_brightness_step_ = 10;
+    lv_obj_t* clock_screen_ = nullptr;
+    ClockDigit clock_digits_[4];
+    lv_obj_t* clock_colon_top_ = nullptr;
+    lv_obj_t* clock_colon_bottom_ = nullptr;
+    esp_timer_handle_t clock_timer_ = nullptr;
+    bool clock_wallpaper_mode_ = false;
+
+    void SetSegmentOn(lv_obj_t* segment, bool on)
+    {
+        if (segment == nullptr) {
+            return;
+        }
+        if (on) {
+            lv_obj_clear_flag(segment, LV_OBJ_FLAG_HIDDEN);
+        } else {
+            lv_obj_add_flag(segment, LV_OBJ_FLAG_HIDDEN);
+        }
+    }
+
+    void SetDigitValue(ClockDigit& digit, int value)
+    {
+        static const uint8_t map[10] = {
+            0x3F, 0x06, 0x5B, 0x4F, 0x66,
+            0x6D, 0x7D, 0x07, 0x7F, 0x6F
+        };
+        uint8_t mask = 0;
+        if (value >= 0 && value <= 9) {
+            mask = map[value];
+        }
+        for (int i = 0; i < 7; ++i) {
+            SetSegmentOn(digit.seg[i], ((mask >> i) & 0x01) != 0);
+        }
+    }
+
+    lv_obj_t* CreateClockSegment(lv_obj_t* parent, int x, int y, int w, int h)
+    {
+        lv_obj_t* seg = lv_obj_create(parent);
+        lv_obj_remove_style_all(seg);
+        lv_obj_set_pos(seg, x, y);
+        lv_obj_set_size(seg, w, h);
+        lv_obj_set_style_bg_opa(seg, LV_OPA_COVER, 0);
+        lv_obj_set_style_bg_color(seg, lv_color_white(), 0);
+        lv_obj_set_style_radius(seg, h / 2, 0);
+        return seg;
+    }
+
+    void CreateClockDigit(ClockDigit& digit, lv_obj_t* parent, int x, int y, int w, int h, int t)
+    {
+        const int middle_y = (h - t) / 2;
+        const int right_x = w - t;
+        const int bottom_y = h - t;
+        const int half_h = h / 2;
+
+        digit.seg[0] = CreateClockSegment(parent, x + t, y, w - 2 * t, t);
+        digit.seg[1] = CreateClockSegment(parent, x + right_x, y + t, t, half_h - t);
+        digit.seg[2] = CreateClockSegment(parent, x + right_x, y + half_h, t, half_h - t);
+        digit.seg[3] = CreateClockSegment(parent, x + t, y + bottom_y, w - 2 * t, t);
+        digit.seg[4] = CreateClockSegment(parent, x, y + half_h, t, half_h - t);
+        digit.seg[5] = CreateClockSegment(parent, x, y + t, t, half_h - t);
+        digit.seg[6] = CreateClockSegment(parent, x + t, y + middle_y, w - 2 * t, t);
+    }
+
+    static void clock_timer_callback(void* arg)
+    {
+        auto* board = static_cast<EspVocat*>(arg);
+        if (board != nullptr) {
+            board->UpdateClockText();
+        }
+    }
+
+    void UpdateClockText()
+    {
+        if (clock_digits_[0].seg[0] == nullptr) {
+            return;
+        }
+        std::time_t now = std::time(nullptr);
+        std::tm local_tm = {};
+        localtime_r(&now, &local_tm);
+
+        if (!lvgl_port_lock(30000)) {
+            return;
+        }
+        SetDigitValue(clock_digits_[0], local_tm.tm_hour / 10);
+        SetDigitValue(clock_digits_[1], local_tm.tm_hour % 10);
+        SetDigitValue(clock_digits_[2], local_tm.tm_min / 10);
+        SetDigitValue(clock_digits_[3], local_tm.tm_min % 10);
+        lvgl_port_unlock();
+    }
+
+    void ShowClockScreen()
+    {
+        if (!lvgl_port_lock(30000)) {
+            return;
+        }
+
+        if (clock_screen_ == nullptr) {
+            clock_screen_ = lv_obj_create(lv_screen_active());
+            lv_obj_remove_style_all(clock_screen_);
+            lv_obj_set_size(clock_screen_, DISPLAY_WIDTH, DISPLAY_HEIGHT);
+            lv_obj_set_style_bg_opa(clock_screen_, LV_OPA_COVER, 0);
+            lv_obj_set_style_bg_color(clock_screen_, lv_color_black(), 0);
+            const int digit_w = (DISPLAY_WIDTH >= 320) ? 64 : 48;
+            const int digit_h = (DISPLAY_HEIGHT >= 320) ? 140 : 100;
+            const int thickness = (DISPLAY_WIDTH >= 320) ? 12 : 9;
+            const int gap = (DISPLAY_WIDTH >= 320) ? 10 : 8;
+            const int colon_w = thickness;
+            const int total_w = digit_w * 4 + gap * 4 + colon_w;
+            const int start_x = (DISPLAY_WIDTH - total_w) / 2;
+            const int start_y = (DISPLAY_HEIGHT - digit_h) / 2;
+
+            CreateClockDigit(clock_digits_[0], clock_screen_, start_x, start_y, digit_w, digit_h, thickness);
+            CreateClockDigit(clock_digits_[1], clock_screen_, start_x + digit_w + gap, start_y, digit_w, digit_h, thickness);
+            CreateClockDigit(clock_digits_[2], clock_screen_, start_x + digit_w * 2 + gap * 3 + colon_w, start_y, digit_w, digit_h, thickness);
+            CreateClockDigit(clock_digits_[3], clock_screen_, start_x + digit_w * 3 + gap * 4 + colon_w, start_y, digit_w, digit_h, thickness);
+
+            const int dot = thickness;
+            const int colon_x = start_x + digit_w * 2 + gap * 2;
+            const int top_dot_y = start_y + digit_h / 2 - dot - 8;
+            const int bottom_dot_y = start_y + digit_h / 2 + 8;
+
+            clock_colon_top_ = lv_obj_create(clock_screen_);
+            lv_obj_remove_style_all(clock_colon_top_);
+            lv_obj_set_pos(clock_colon_top_, colon_x, top_dot_y);
+            lv_obj_set_size(clock_colon_top_, dot, dot);
+            lv_obj_set_style_bg_opa(clock_colon_top_, LV_OPA_COVER, 0);
+            lv_obj_set_style_bg_color(clock_colon_top_, lv_color_white(), 0);
+            lv_obj_set_style_radius(clock_colon_top_, LV_RADIUS_CIRCLE, 0);
+
+            clock_colon_bottom_ = lv_obj_create(clock_screen_);
+            lv_obj_remove_style_all(clock_colon_bottom_);
+            lv_obj_set_pos(clock_colon_bottom_, colon_x, bottom_dot_y);
+            lv_obj_set_size(clock_colon_bottom_, dot, dot);
+            lv_obj_set_style_bg_opa(clock_colon_bottom_, LV_OPA_COVER, 0);
+            lv_obj_set_style_bg_color(clock_colon_bottom_, lv_color_white(), 0);
+            lv_obj_set_style_radius(clock_colon_bottom_, LV_RADIUS_CIRCLE, 0);
+        }
+
+        lv_obj_clear_flag(clock_screen_, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_move_foreground(clock_screen_);
+        clock_wallpaper_mode_ = true;
+        lvgl_port_unlock();
+
+        UpdateClockText();
+
+        if (clock_timer_ == nullptr) {
+            const esp_timer_create_args_t timer_args = {
+                .callback = clock_timer_callback,
+                .arg = this,
+                .dispatch_method = ESP_TIMER_TASK,
+                .name = "vocat_clock",
+                .skip_unhandled_events = true,
+            };
+            ESP_ERROR_CHECK(esp_timer_create(&timer_args, &clock_timer_));
+            ESP_ERROR_CHECK(esp_timer_start_periodic(clock_timer_, 1000000));
+        }
+    }
+
+    void HideClockScreen()
+    {
+        if (!clock_wallpaper_mode_) {
+            return;
+        }
+        if (!lvgl_port_lock(30000)) {
+            return;
+        }
+        if (clock_screen_ != nullptr) {
+            lv_obj_add_flag(clock_screen_, LV_OBJ_FLAG_HIDDEN);
+        }
+        clock_wallpaper_mode_ = false;
+        lvgl_port_unlock();
+    }
+
+    void ChangeBacklightBrightness(int delta)
+    {
+        if (backlight_ == nullptr) {
+            return;
+        }
+        int value = static_cast<int>(backlight_->brightness()) + delta;
+        if (value < 1) {
+            value = 1;
+        }
+        if (value > 100) {
+            value = 100;
+        }
+        backlight_->SetBrightness(static_cast<uint8_t>(value), true);
+        if (display_ != nullptr) {
+            display_->ShowNotification(std::string("Brightness: ") + std::to_string(value), 1000);
+        }
+    }
+
+    void HandleTouchRelease()
+    {
+        auto &app = Application::GetInstance();
+        if (app.GetDeviceState() == kDeviceStateStarting) {
+            EnterWifiConfigMode();
+            return;
+        }
+
+        auto point = cst816s_->GetTouchPoint();
+        if (point.y >= 0 && point.y < (DISPLAY_HEIGHT / 3)) {
+            ChangeBacklightBrightness(touch_brightness_step_);
+            return;
+        }
+        if (point.y >= ((DISPLAY_HEIGHT * 2) / 3) && point.y < DISPLAY_HEIGHT) {
+            ChangeBacklightBrightness(-touch_brightness_step_);
+            return;
+        }
+        app.ToggleChatState();
+    }
 
     void InitializeI2c()
     {
@@ -470,7 +728,6 @@ private:
 
         while (true) {
             if (touchpad->WaitForTouchEvent()) {
-                auto &app = Application::GetInstance();
                 auto &board = (EspVocat &)Board::GetInstance();
 
                 ESP_LOGD(TAG, "Touch event, TP_PIN_NUM_INT: %d", gpio_get_level(TP_PIN_NUM_INT));
@@ -478,11 +735,16 @@ private:
                 auto touch_event = touchpad->CheckTouchEvent();
 
                 if (touch_event == Cst816s::TOUCH_RELEASE) {
-                    if (app.GetDeviceState() == kDeviceStateStarting) {
-                        board.EnterWifiConfigMode();
-                    } else {
-                        app.ToggleChatState();
+                    if (board.clock_wallpaper_mode_) {
+                        continue;
                     }
+                    board.HandleTouchRelease();
+                } else if (touch_event == Cst816s::TOUCH_LONG_PRESS) {
+                    board.EnterWifiConfigMode();
+                } else if (touch_event == Cst816s::TOUCH_SWIPE_LEFT) {
+                    board.ShowClockScreen();
+                } else if (touch_event == Cst816s::TOUCH_SWIPE_RIGHT) {
+                    board.HideClockScreen();
                 }
             }
         }
@@ -503,13 +765,15 @@ private:
         const gpio_config_t int_gpio_config = {
             .pin_bit_mask = (1ULL << TP_PIN_NUM_INT),
             .mode = GPIO_MODE_INPUT,
-            // .intr_type = GPIO_INTR_NEGEDGE
             .intr_type = GPIO_INTR_ANYEDGE
         };
-        gpio_config(&int_gpio_config);
-        gpio_install_isr_service(0);
-        gpio_intr_enable(TP_PIN_NUM_INT);
-        gpio_isr_handler_add(TP_PIN_NUM_INT, EspVocat::touch_isr_callback, cst816s_);
+        ESP_ERROR_CHECK(gpio_config(&int_gpio_config));
+        esp_err_t isr_ret = gpio_install_isr_service(0);
+        if (isr_ret != ESP_OK && isr_ret != ESP_ERR_INVALID_STATE) {
+            ESP_ERROR_CHECK(isr_ret);
+        }
+        ESP_ERROR_CHECK(gpio_intr_enable(TP_PIN_NUM_INT));
+        ESP_ERROR_CHECK(gpio_isr_handler_add(TP_PIN_NUM_INT, EspVocat::touch_isr_callback, cst816s_));
     }
 
     void InitializeSpi()
@@ -619,6 +883,11 @@ public:
         }
         if (touch_task_handle_ != nullptr) {
             vTaskDelete(touch_task_handle_);
+        }
+        if (clock_timer_ != nullptr) {
+            esp_timer_stop(clock_timer_);
+            esp_timer_delete(clock_timer_);
+            clock_timer_ = nullptr;
         }
 
         // Delete objects

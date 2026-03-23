@@ -64,6 +64,8 @@ ESP-VoCat 支持多种不同的 UI 显示风格，通过 menuconfig 配置选择
 - **类**: `SpiLcdDisplay`
 
 > **说明**: ESP-VoCat 喵伴使用16MB Flash，需要使用专门的分区表配置来合理分配存储空间给应用程序、OTA更新、资源文件等。
+> 分区文件建议使用：`partitions/v2/16m_vocat.csv`
+> 若需手动设置：`Partition Table` → `Custom partition table CSV` → `Custom partition CSV file` 填写 `partitions/v2/16m_vocat.csv`
 
 按 `S` 保存，按 `Q` 退出。
 
