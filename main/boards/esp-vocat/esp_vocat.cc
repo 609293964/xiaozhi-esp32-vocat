@@ -7,6 +7,7 @@
 #include "config.h"
 #include "backlight.h"
 #include "esp_video.h"
+#include "settings.h"
 
 #include <esp_log.h>
 
@@ -24,11 +25,13 @@
 #include <freertos/semphr.h>
 #include <freertos/task.h>
 #include <esp_timer.h>
+#include <esp_sleep.h>
 #include <esp_lvgl_port.h>
 #include <lvgl.h>
 #include <string>
 #include <ctime>
 #include <cstdlib>
+#include <atomic>
 
 #define TAG "ESP-VoCat"
 LV_FONT_DECLARE(BUILTIN_TEXT_FONT);
@@ -248,10 +251,13 @@ public:
 
         int16_t voltage = static_cast<uint16_t>(read_buffer_[1] << 8 | read_buffer_[0]);
         int16_t current = static_cast<int16_t>(read_buffer_[3] << 8 | read_buffer_[2]);
-        
-        // Use the variables to avoid warnings (can be removed if actual implementation uses them)
-        (void)voltage;
-        (void)current;
+        latest_voltage_ = voltage;
+        latest_current_ = current;
+        if (current > 30) {
+            external_power_connected_ = true;
+        } else if (current < -30) {
+            external_power_connected_ = false;
+        }
     }
     static void TaskFunction(void *pvParameters)
     {
@@ -261,9 +267,21 @@ public:
             vTaskDelay(pdMS_TO_TICKS(300));
         }
     }
+    bool IsExternalPowerConnected() const
+    {
+        return external_power_connected_.load();
+    }
+
+    int16_t GetCurrent() const
+    {
+        return latest_current_.load();
+    }
 
 private:
     uint8_t* read_buffer_ = nullptr;
+    std::atomic<int16_t> latest_voltage_{0};
+    std::atomic<int16_t> latest_current_{0};
+    std::atomic<bool> external_power_connected_{true};
 };
 
 class Cst816s : public I2cDevice {
@@ -441,6 +459,7 @@ private:
     EspVideo* camera_ = nullptr;
     TaskHandle_t charge_task_handle_ = nullptr;
     TaskHandle_t touch_task_handle_ = nullptr;
+    TaskHandle_t power_policy_task_handle_ = nullptr;
     int touch_brightness_step_ = 10;
     lv_obj_t* clock_screen_ = nullptr;
     ClockDigit clock_digits_[4];
@@ -448,6 +467,14 @@ private:
     lv_obj_t* clock_colon_bottom_ = nullptr;
     esp_timer_handle_t clock_timer_ = nullptr;
     bool clock_wallpaper_mode_ = false;
+    bool external_power_connected_ = true;
+    bool power_loss_countdown_active_ = false;
+    int64_t power_loss_deadline_us_ = 0;
+    bool screen_off_by_schedule_ = false;
+    int32_t shutdown_delay_min_ = 10;
+    int32_t screen_off_start_hour_ = 1;
+    int32_t screen_off_end_hour_ = 8;
+    int64_t next_settings_reload_us_ = 0;
 
     void SetSegmentOn(lv_obj_t* segment, bool on)
     {
@@ -533,6 +560,18 @@ private:
 
     void ShowClockScreen()
     {
+#if CONFIG_USE_EMOTE_MESSAGE_STYLE
+        char time_text[6] = {0};
+        std::time_t now = std::time(nullptr);
+        std::tm local_tm = {};
+        localtime_r(&now, &local_tm);
+        std::strftime(time_text, sizeof(time_text), "%H:%M", &local_tm);
+        if (display_ != nullptr) {
+            display_->ShowNotification(time_text, 1500);
+        }
+        return;
+#endif
+
         if (!lvgl_port_lock(30000)) {
             return;
         }
@@ -601,6 +640,10 @@ private:
 
     void HideClockScreen()
     {
+#if CONFIG_USE_EMOTE_MESSAGE_STYLE
+        return;
+#endif
+
         if (!clock_wallpaper_mode_) {
             return;
         }
@@ -650,6 +693,129 @@ private:
             return;
         }
         app.ToggleChatState();
+    }
+
+    bool IsNightScreenOffHour(int hour) const
+    {
+        if (screen_off_start_hour_ == screen_off_end_hour_) {
+            return false;
+        }
+        if (screen_off_start_hour_ < screen_off_end_hour_) {
+            return hour >= screen_off_start_hour_ && hour < screen_off_end_hour_;
+        }
+        return hour >= screen_off_start_hour_ || hour < screen_off_end_hour_;
+    }
+
+    void ReloadPowerPolicySettings(bool force = false)
+    {
+        int64_t now_us = esp_timer_get_time();
+        if (!force && now_us < next_settings_reload_us_) {
+            return;
+        }
+
+        Settings settings("wifi", false);
+        int32_t shutdown_delay = settings.GetInt("power_off_delay_min", 10);
+        if (shutdown_delay < 1) {
+            shutdown_delay = 1;
+        }
+        if (shutdown_delay > 720) {
+            shutdown_delay = 720;
+        }
+        shutdown_delay_min_ = shutdown_delay;
+
+        int32_t start_hour = settings.GetInt("screen_off_start_hour", 1);
+        if (start_hour < 0) {
+            start_hour = 0;
+        }
+        if (start_hour > 23) {
+            start_hour = 23;
+        }
+        screen_off_start_hour_ = start_hour;
+
+        int32_t end_hour = settings.GetInt("screen_off_end_hour", 8);
+        if (end_hour < 0) {
+            end_hour = 0;
+        }
+        if (end_hour > 23) {
+            end_hour = 23;
+        }
+        screen_off_end_hour_ = end_hour;
+        next_settings_reload_us_ = now_us + 60LL * 1000000LL;
+    }
+
+    void UpdateNightDisplayPolicy()
+    {
+        if (backlight_ == nullptr) {
+            return;
+        }
+        std::time_t now = std::time(nullptr);
+        std::tm local_tm = {};
+        localtime_r(&now, &local_tm);
+        int year = local_tm.tm_year + 1900;
+        if (year < 2024) {
+            return;
+        }
+
+        bool should_off = IsNightScreenOffHour(local_tm.tm_hour);
+        if (should_off && !screen_off_by_schedule_) {
+            backlight_->SetBrightness(0);
+            screen_off_by_schedule_ = true;
+        } else if (!should_off && screen_off_by_schedule_) {
+            backlight_->RestoreBrightness();
+            screen_off_by_schedule_ = false;
+        }
+    }
+
+    void ShutdownDueToPowerLoss()
+    {
+        ESP_LOGW(TAG, "Power disconnected timeout reached, shutting down");
+        gpio_set_level(POWER_CTRL, 1);
+        vTaskDelay(pdMS_TO_TICKS(200));
+        esp_deep_sleep_start();
+    }
+
+    void UpdatePowerConnectionPolicy()
+    {
+        if (charge_ == nullptr) {
+            return;
+        }
+        bool connected = charge_->IsExternalPowerConnected();
+        int64_t now_us = esp_timer_get_time();
+        if (connected != external_power_connected_) {
+            external_power_connected_ = connected;
+            if (connected) {
+                gpio_set_level(POWER_CTRL, 0);
+                power_loss_countdown_active_ = false;
+                if (!screen_off_by_schedule_ && backlight_ != nullptr) {
+                    backlight_->RestoreBrightness();
+                }
+                ESP_LOGI(TAG, "External power connected, auto power-on policy applied");
+            } else {
+                power_loss_countdown_active_ = true;
+                power_loss_deadline_us_ = now_us + static_cast<int64_t>(shutdown_delay_min_) * 60LL * 1000000LL;
+                ESP_LOGI(TAG, "External power disconnected, shutdown in %ld minutes", static_cast<long>(shutdown_delay_min_));
+            }
+        }
+
+        if (!external_power_connected_ && power_loss_countdown_active_ && now_us >= power_loss_deadline_us_) {
+            ShutdownDueToPowerLoss();
+        }
+    }
+
+    static void power_policy_task(void* arg)
+    {
+        auto* board = static_cast<EspVocat*>(arg);
+        if (board == nullptr) {
+            vTaskDelete(NULL);
+            return;
+        }
+        board->ReloadPowerPolicySettings(true);
+        while (true) {
+            board->ReloadPowerPolicySettings();
+            board->UpdatePowerConnectionPolicy();
+            board->UpdateNightDisplayPolicy();
+            vTaskDelay(pdMS_TO_TICKS(5000));
+        }
     }
 
     void InitializeI2c()
@@ -754,6 +920,13 @@ private:
     {
         charge_ = new Charge(i2c_bus_, 0x55);
         xTaskCreatePinnedToCore(Charge::TaskFunction, "batterydecTask", 3 * 1024, charge_, 6, &charge_task_handle_, 0);
+    }
+
+    void InitializePowerPolicy()
+    {
+        external_power_connected_ = true;
+        power_loss_countdown_active_ = false;
+        xTaskCreatePinnedToCore(power_policy_task, "power_policy_task", 4 * 1024, this, 4, &power_policy_task_handle_, 1);
     }
 
     void InitializeCst816sTouchPad()
@@ -884,6 +1057,9 @@ public:
         if (touch_task_handle_ != nullptr) {
             vTaskDelete(touch_task_handle_);
         }
+        if (power_policy_task_handle_ != nullptr) {
+            vTaskDelete(power_policy_task_handle_);
+        }
         if (clock_timer_ != nullptr) {
             esp_timer_stop(clock_timer_);
             esp_timer_delete(clock_timer_);
@@ -914,6 +1090,7 @@ public:
         InitializeI2c();
         uint8_t pcb_version = DetectPcbVersion();
         InitializeCharge();
+        InitializePowerPolicy();
         InitializeCst816sTouchPad();
 
         InitializeSpi();
